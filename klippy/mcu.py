@@ -138,15 +138,18 @@ class MCU_endstop:
         self._rest_ticks = 0
         ffi_main, ffi_lib = chelper.get_ffi()
         self._trdispatch = ffi_main.gc(ffi_lib.trdispatch_alloc(), ffi_lib.free)
-        self._trsync = MCU_trsync(mcu, self._trdispatch)
+        self._trsyncs = [MCU_trsync(mcu, self._trdispatch)]
     def get_mcu(self):
         return self._mcu
     def add_stepper(self, stepper):
-        if stepper.get_mcu() is not self._mcu:
-            raise pins.error("Endstop and stepper must be on the same mcu")
-        self._trsync.add_stepper(stepper)
+        trsyncs = {trsync.get_mcu(): trsync for trsync in self._trsyncs}
+        trsync = trsyncs.get(stepper.get_mcu())
+        if trsync is None:
+            trsync = MCU_trsync(stepper.get_mcu(), self._trdispatch)
+            self._trsyncs.append(trsync)
+        trsync.add_stepper(stepper)
     def get_steppers(self):
-        return self._trsync.get_steppers()
+        return [s for trsync in self._trsyncs for s in trsync.get_steppers()]
     def _build_config(self):
         # Setup config
         self._mcu.add_config_cmd("config_endstop oid=%d pin=%s pull_up=%d"
@@ -156,7 +159,7 @@ class MCU_endstop:
             " rest_ticks=0 pin_value=0 trsync_oid=0 trigger_reason=0"
             % (self._oid,), on_restart=True)
         # Lookup commands
-        cmd_queue = self._trsync.get_command_queue()
+        cmd_queue = self._trsyncs[0].get_command_queue()
         self._home_cmd = self._mcu.lookup_command(
             "endstop_home oid=%c clock=%u sample_ticks=%u sample_count=%c"
             " rest_ticks=%u pin_value=%c trsync_oid=%c trigger_reason=%c",
@@ -172,8 +175,12 @@ class MCU_endstop:
         self._rest_ticks = rest_ticks
         reactor = self._mcu.get_printer().get_reactor()
         self._trigger_completion = reactor.completion()
-        etrsync = self._trsync
-        etrsync.start(print_time, self._trigger_completion, .250)
+        expire_timeout = .025 # XXX
+        if len(self._trsyncs) == 1:
+            expire_timeout = .250
+        for trsync in self._trsyncs:
+            trsync.start(print_time, self._trigger_completion, expire_timeout)
+        etrsync = self._trsyncs[0]
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_start(self._trdispatch, etrsync.REASON_HOST_REQUEST)
         self._home_cmd.send(
@@ -182,7 +189,7 @@ class MCU_endstop:
              etrsync.get_oid(), etrsync.REASON_ENDSTOP_HIT], reqclock=clock)
         return self._trigger_completion
     def home_wait(self, home_end_time):
-        etrsync = self._trsync
+        etrsync = self._trsyncs[0]
         etrsync.set_home_end_time(home_end_time)
         if self._mcu.is_fileoutput():
             self._trigger_completion.complete(True)
@@ -190,10 +197,10 @@ class MCU_endstop:
         self._home_cmd.send([self._oid, 0, 0, 0, 0, 0, 0, 0])
         ffi_main, ffi_lib = chelper.get_ffi()
         ffi_lib.trdispatch_stop(self._trdispatch)
-        res = etrsync.stop()
-        if res == etrsync.REASON_COMMS_TIMEOUT:
+        res = [trsync.stop() for trsync in self._trsyncs]
+        if any([r == etrsync.REASON_COMMS_TIMEOUT for r in res]):
             return -1.
-        if res != etrsync.REASON_ENDSTOP_HIT:
+        if res[0] != etrsync.REASON_ENDSTOP_HIT:
             return 0.
         if self._mcu.is_fileoutput():
             return home_end_time
